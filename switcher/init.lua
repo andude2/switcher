@@ -1,32 +1,39 @@
 local mq = require 'mq'
 local imgui = require 'ImGui'
 
-local DANNET = require 'lib.vs.DANNET'
-if DANNET.checkVersion(1,1) == false then mq.exit() end
-
-local TABLE = require 'lib.vs.TABLE'
-if TABLE.checkVersion(1,0) == false then mq.exit() end
+if not mq.TLO.MQ2Mono then
+    print('\arError: MQ2Mono plugin is not loaded. Please load it with /plugin MQ2Mono\ax')
+    mq.exit()
+end
 
 local OpenUI, ShowUI = true, true
 local SwitcherName = 'Switcher'
-local SwitcherVersion = '0.4'
+local SwitcherVersion = '2.4'
 
-local command_line_args = {...}
-local first_imgui_frame = true
-local peer_list_refreshed = false
-local peer_list_last_refreshed = 0
 local peer_list = {}
-local peer_list_ui = {}
-local peer_name_cache = {}
-local observer_list = DANNET.newObserverList()
+local peer_map = {} -- Tracks peers by name for quick updates
 
-local NAME_QUERY = 'Me.CleanName'
-local LEADER_QUERY = 'Group.Leader.CleanName'
-local CLASS_QUERY = 'Me.Class.ShortName'
-local HP_QUERY = 'Me.PctHPs'
+-- 🔄 Refresh settings
+local refreshInterval = 500 -- Refresh every 500ms (0.5 seconds)
+local staleDataTimeout = 10 -- Remove peers if they haven't updated in 10 seconds
+
+-- 🔄 Keeps track of when each peer was last updated
+local lastUpdateTime = {}
 
 -- Sorting Mode
 local sort_mode = "Alphabetical"
+
+-- Column Visibility (User Selectable)
+local show_name = true
+local show_hp = true
+local show_class = true
+
+-- 🔄 **Fix: Define switchTo function**
+local function switchTo(name)
+    if name and type(name) == 'string' then
+        mq.cmdf('/dex %s /foreground', name)
+    end
+end
 
 -- Function to show sorting dropdown in UI
 local function sortDropdown()
@@ -43,6 +50,16 @@ local function sortDropdown()
     end
 end
 
+-- Function to show checkboxes for column visibility
+local function columnSelection()
+    ImGui.Text("Show Columns: ")
+    show_name = ImGui.Checkbox("Name", show_name)
+    ImGui.SameLine()
+    show_hp = ImGui.Checkbox("HP (%)", show_hp)
+    ImGui.SameLine()
+    show_class = ImGui.Checkbox("Class", show_class)
+end
+
 -- Function to show tooltips
 local function showToolTip(tooltip)
     if tooltip ~= nil and ImGui.IsItemHovered() then
@@ -52,158 +69,136 @@ local function showToolTip(tooltip)
     end
 end
 
--- Refresh the peer list and apply sorting
-local function refreshPeerList()
-    if os.difftime(os.time(), peer_list_last_refreshed) == 0 then return end
-    peer_list_last_refreshed = os.time()
+-- 🔄 **Refresh Peer List Using MQ2Mono**
+local function refreshPeers()
+    local currentTime = os.time()
+    local myInstance = tostring(mq.TLO.Me.Instance()) -- Get the player's current instance as a string
 
-    local peer_names = DANNET.getPeers()
+    -- Get the list of all connected clients
+    local clientList = mq.TLO.MQ2Mono.Query("e3,E3Bots.ConnectedClients")()
+    
+    if not clientList or clientList == "" then
+        return
+    end
 
-    -- Populate cache if new peers detected
+    -- Convert the comma-separated list into a Lua table
+    local peer_names = {}
+    for botName in string.gmatch(clientList, "([^,]+)") do
+        table.insert(peer_names, botName)
+    end
+
+    -- Process each peer in the list
     for _, peer in ipairs(peer_names) do
-        if peer_name_cache[peer] == nil then
-            peer_name_cache[peer] = DANNET.query(peer, NAME_QUERY)
+        local name = mq.TLO.MQ2Mono.Query(string.format("e3,E3Bots(%s).Query(Name)", peer))() or peer
+        local leader = mq.TLO.MQ2Mono.Query(string.format("e3,E3Bots(%s).Leader", peer))() or "N/A"
+        local hp = mq.TLO.MQ2Mono.Query(string.format("e3,E3Bots(%s).PctHPs", peer))() or 0
+        local class = mq.TLO.MQ2Mono.Query(string.format("e3,E3Bots(%s).Query(Class)", peer))() or "Unknown"
+        local instance = tostring(mq.TLO.MQ2Mono.Query(string.format("e3,E3Bots(%s).Instance", peer))() or "Unknown")
+
+        -- Determine if the peer is in the same zone
+        local inSameZone = (instance == myInstance)
+
+        -- Update or add the peer in the peer_map
+        if not peer_map[name] or peer_map[name].hp ~= hp or peer_map[name].class ~= class or peer_map[name].inSameZone ~= inSameZone then
+            peer_map[name] = { name = name, leader = leader, hp = tonumber(hp), class = class, inSameZone = inSameZone }
+        end
+
+        -- Update the timestamp for this peer
+        lastUpdateTime[name] = currentTime
+    end
+
+    -- Remove stale peers from peer_map
+    for name, lastSeen in pairs(lastUpdateTime) do
+        if os.difftime(currentTime, lastSeen) > staleDataTimeout then
+            peer_map[name] = nil
+            lastUpdateTime[name] = nil
         end
     end
 
-    -- Sorting based on selected mode
-    if sort_mode == "Alphabetical" then
-        table.sort(peer_names, function(a, b)
-            return (peer_name_cache[a] or ""):lower() < (peer_name_cache[b] or ""):lower()
-        end)
-    elseif sort_mode == "Class" then
-        table.sort(peer_names, function(a, b)
-            local classA = DANNET.query(a, CLASS_QUERY) or ""
-            local classB = DANNET.query(b, CLASS_QUERY) or ""
-            return classA < classB
-        end)
-    end
-
-    -- Update peer list
-    DANNET.removeAll(observer_list)  -- Clear previous observers
+    -- Update the peer_list for display purposes
     peer_list = {}
-
-    for _, peer in ipairs(peer_names) do
-        local name = peer_name_cache[peer]
-        if name then
-            local leader = DANNET.observe(peer, LEADER_QUERY)
-            local hp = DANNET.query(peer, HP_QUERY) or 0
-            table.insert(peer_list, { name = name, leader = leader, hp = tonumber(hp) })
-        end
-        DANNET.addPeer(observer_list, peer)
+    for _, peer in pairs(peer_map) do
+        table.insert(peer_list, peer)
     end
 
-    peer_list_refreshed = true
-end
-
--- Update UI Peer List
-local function updatePeerListUI()
-    if peer_list_refreshed then
-        peer_list_ui = TABLE.copy(peer_list)
-        peer_list_refreshed = false
-    end
-end
-
--- Load script on all peers
-local function button_LoadAll()
-    if ImGui.SmallButton('Load All') then
-        local x, y = ImGui.GetWindowPos()
-        mq.cmdf('/dge /lua run %s %s %s', SwitcherName, x, y)
-    end
-    showToolTip('Load on all other peers at current position. Will not reload peers if they are already running.')
-end
-
--- Unload script on all peers
-local function button_UnloadAll()
-    if ImGui.SmallButton('Unload All') then
-        mq.cmdf('/dge /switcher unload')
-    end
-    showToolTip('Unload on all other peers. Use before "Load All" to reset positions.')
-end
-
--- Switch focus to another EQ client
-local function switchTo(name)
-    if name and type(name) == 'string' then
-        mq.cmdf('/dex %s /foreground', name)
-    end
-end
-
--- Face another player character
-local function turnTo(name)
-    if name and type(name) == 'string' then
-        mq.cmdf('/multiline ; /tar PC %s; /face; /if (${Cursor.ID}) /click left target', name)
+    -- Sort the peer_list
+    if sort_mode == "Alphabetical" then
+        table.sort(peer_list, function(a, b) return a.name:lower() < b.name:lower() end)
+    elseif sort_mode == "Class" then
+        table.sort(peer_list, function(a, b) return a.class < b.class end)
     end
 end
 
 -- Display Peer List in UI
 local function show_Peers()
-    updatePeerListUI()
-
     -- Table Headers
-    if ImGui.BeginTable("##PeerTable", 2, ImGuiTableFlags.Resizable) then
-        ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch)
-        ImGui.TableSetupColumn("HP (%)", ImGuiTableColumnFlags.WidthFixed, 50)
+    if ImGui.BeginTable("##PeerTable", 3, ImGuiTableFlags.Resizable) then
+        if show_name then ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch) end
+        if show_hp then ImGui.TableSetupColumn("HP (%)", ImGuiTableColumnFlags.WidthFixed, 50) end
+        if show_class then ImGui.TableSetupColumn("Class", ImGuiTableColumnFlags.WidthFixed, 50) end
         ImGui.TableHeadersRow()
 
-        for _, peer in ipairs(peer_list_ui) do
+        for _, peer in ipairs(peer_list) do
             ImGui.TableNextRow()
-            ImGui.TableNextColumn()
 
-            if ImGui.Selectable(peer.name) then switchTo(peer.name) end
-            if ImGui.IsItemClicked(ImGuiMouseButton.Right) then turnTo(peer.name) end
-            showToolTip('Left-click to switch. Right-click to target.')
+            if show_name then
+                ImGui.TableNextColumn()
+                -- Apply color based on zone status
+                if peer.inSameZone then
+                    ImGui.PushStyleColor(ImGuiCol.Text, 0, 1, 0, 1) -- Green for same zone
+                else
+                    ImGui.PushStyleColor(ImGuiCol.Text, 1, 0, 0, 1) -- Red for different zone
+                end
 
-            ImGui.TableNextColumn()
-            ImGui.Text(string.format("%.0f%%", peer.hp or 0))
+                if ImGui.Selectable(peer.name) then switchTo(peer.name) end
+                showToolTip('Left-click to switch.')
+
+                ImGui.PopStyleColor() -- Revert to default color
+            end
+
+            if show_hp then
+                ImGui.TableNextColumn()
+                ImGui.Text(string.format("%.0f%%", peer.hp or 0))
+            end
+
+            if show_class then
+                ImGui.TableNextColumn()
+                ImGui.Text(peer.class)
+            end
         end
         ImGui.EndTable()
-    end
-end
-
--- Set UI Window Position on First Frame
-local function firstFrameOnly()
-    if first_imgui_frame then
-        first_imgui_frame = false
-        if command_line_args[1] and command_line_args[2] then
-            local x, y = tonumber(command_line_args[1]), tonumber(command_line_args[2])
-            if x >= 0 and y >= 0 then ImGui.SetNextWindowPos(x, y) end
-        end
     end
 end
 
 -- Main UI Window
 function SwitcherUI()
     if OpenUI then
-        firstFrameOnly()
         ImGui.SetNextWindowBgAlpha(0.8)
         local window_flags = bit32.bor(ImGuiWindowFlags.Resizable, ImGuiWindowFlags.NoCollapse)
         OpenUI, ShowUI = ImGui.Begin(SwitcherName, OpenUI, window_flags)
 
         if ShowUI then
-            button_LoadAll()
-            ImGui.SameLine()
-            button_UnloadAll()
-            sortDropdown()  -- Sorting Dropdown
+            columnSelection()
             show_Peers()
+            sortDropdown()
         end
         
         ImGui.End()
     end
 end
 
--- Initialize Script
-local function init()
-    DANNET.addQuery(observer_list, LEADER_QUERY)
-    mq.bind('/switcher', function() OpenUI = false end)
-    mq.bind('/switchto', switchTo)
-    mq.bind('/to', switchTo)
-    mq.imgui.init(SwitcherName, SwitcherUI)
+-- **Run the Peer Refresh in a Separate Loop**
+local function eventLoop()
+    while OpenUI and mq.TLO.MacroQuest.GameState() == 'INGAME' do
+        refreshPeers() -- Updates in real-time using MQ2Mono
+        mq.delay(refreshInterval) -- Controls refresh speed
+    end
 end
 
--- Main Loop
-init()
-while OpenUI and mq.TLO.MacroQuest.GameState() == 'INGAME' do
-    refreshPeerList()
-    mq.delay(100)
+-- Initialize Script
+local function init()
+    mq.imgui.init(SwitcherName, SwitcherUI)
+    eventLoop()
 end
-DANNET.removeAll(observer_list)
+
+init()
