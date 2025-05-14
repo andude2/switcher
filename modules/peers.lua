@@ -5,6 +5,7 @@ local mq = require('mq')
 local imgui = require('ImGui')
 local actors = require('actors')
 local utils = require('switcher.modules.utils') -- Assuming utils.lua is available
+local buffs = require('switcher.modules.buffs') -- Assuming buffs.lua is available
 
 local M = {} -- Module table
 
@@ -75,6 +76,29 @@ local function calculateCurrentDPS()
     return totalDmg / duration
 end
 
+function encode_redis_command(args)
+    local cmd = "*" .. #args .. "\r\n"
+    for _, arg in ipairs(args) do
+        arg = tostring(arg)
+        cmd = cmd .. "$" .. #arg .. "\r\n" .. arg .. "\r\n"
+    end
+    return cmd
+end
+
+function send_redis_command(client, command)
+    local ok, err = client:send(command)
+    if not ok then
+        print("\ar[Redis] Failed to send command: " .. tostring(err) .. "\ax")
+        return nil
+    end
+    local response, err = client:receive("*l")
+    if not response then
+        print("\ar[Redis] Failed to receive response: " .. tostring(err) .. "\ax")
+        return nil
+    end
+    return response
+end
+
 local function publishHealthStatus()
     local currentTime = os.time()
     if os.difftime(currentTime, lastPublishTime) < PUBLISH_INTERVAL_S then
@@ -95,6 +119,32 @@ local function publishHealthStatus()
     }
     actor_mailbox:send({ mailbox = 'peer_status' }, status)
     --print(string.format("[Peers] Published status: %s/%s HP: %d%% DPS: %.1f", MyName, MyServer, status.hp, status.dps))
+    local socket = require('socket')
+    local json = require('dkjson')
+    local me = mq.TLO.Me
+    local zone = mq.TLO.Zone.ShortName()
+    local charName = me.Name()
+
+    -- Get buff data
+    local buffs_json = ""
+    if buffs and buffs.get_current then
+        local buffList = buffs.get_current()
+        buffs_json = json.encode({
+            name = charName,
+            zone = zone,
+            buffs = buffList
+        })
+    end
+
+    -- Connect and push
+    local client = socket.tcp()
+    client:settimeout(0.5)
+    local ok, err = client:connect("127.0.0.1", 6379)
+    if ok then
+        local key = string.format("eqbuff:%s:%s", zone, charName)
+        send_redis_command(client, encode_redis_command({"SET", key, buffs_json}))
+        client:close()
+    end
     lastPublishTime = currentTime
 end
 

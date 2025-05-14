@@ -719,6 +719,30 @@ function M.update()
     M.buffWindow:UpdateBuffs()
 end
 
+function M.get_current()
+    local buffList = {}
+
+    local function extractBuffs(window, label)
+        if not window or not window.buffs then return end
+        for _, buff in ipairs(window.buffs) do
+            if buff.valid and buff.name then
+                table.insert(buffList, {
+                    name = buff.name,
+                    duration = buff.duration,
+                    remaining = buff.remaining,
+                    color = buff.barColor,
+                    type = label,
+                })
+            end
+        end
+    end
+
+    extractBuffs(M.buffWindow, "buff")
+    extractBuffs(M.songWindow, "song")
+
+    return buffList
+end
+
 -- Initialize the buff window instance
 function M.init()
      -- Ensure we have a valid name before loading/saving settings
