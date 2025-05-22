@@ -77,43 +77,71 @@ local function CombinedUI()
         combinedUIInitialized = true
     end
 
-    -- Begin main window
-    if imgui.Begin("EQ Companion Hub") then
+        if peers.options.borderless then
+        windowFlags = bit32.bor(ImGuiWindowFlags.NoTitleBar)
+    else
+        windowFlags = 0 --ImGuiWindowFlags.MenuBar -- Uncomment ImGuiWindowFlags here, and Menu Bar below to change display options
+    end
 
-        -- Menu Bar
-        if imgui.BeginMenuBar() then
-            if imgui.BeginMenu("Switcher Options") then
-                 -- Menu items directly modify the options table in the peers module
-                 local changed
-                 changed, peers.options.show_name = imgui.Checkbox("Show Name", peers.options.show_name)
-                 changed, peers.options.show_hp = imgui.Checkbox("Show HP (%)", peers.options.show_hp)
-                 changed, peers.options.show_distance = imgui.Checkbox("Show Distance", peers.options.show_distance)
-                 changed, peers.options.show_dps = imgui.Checkbox("Show DPS", peers.options.show_dps)
-                 imgui.Separator()
-                 if imgui.BeginMenu("Sort By") then
-                      if imgui.MenuItem("Alphabetical", nil, peers.options.sort_mode == "Alphabetical") then peers.options.sort_mode = "Alphabetical" end
-                      if imgui.MenuItem("HP (Asc)", nil, peers.options.sort_mode == "HP") then peers.options.sort_mode = "HP" end
-                      if imgui.MenuItem("Distance (Asc)", nil, peers.options.sort_mode == "Distance") then peers.options.sort_mode = "Distance" end
-                      if imgui.MenuItem("DPS (Desc)", nil, peers.options.sort_mode == "DPS") then peers.options.sort_mode = "DPS" end
-                      imgui.EndMenu()
-                 end
-                 imgui.Separator()
-                 if imgui.MenuItem("Show AA Window", nil, showPeerAAWindow.value) then
-                     showPeerAAWindow.value = not showPeerAAWindow.value
-                 end
-                imgui.EndMenu()
+    -- Begin main window
+    if imgui.Begin("EQ Hub") then
+
+        if imgui.BeginPopupContextWindow("##HubContext", ImGuiPopupFlags.MouseButtonRight) then
+
+        imgui.Text("Switcher Options")
+        imgui.Separator()
+
+        peers.options.show_name     = imgui.Checkbox("Show Name", peers.options.show_name)
+        peers.options.show_hp       = imgui.Checkbox("Show HP (%)", peers.options.show_hp)
+        peers.options.show_mana     = imgui.Checkbox("Show Mana (%)", peers.options.show_mana)
+        peers.options.show_distance = imgui.Checkbox("Show Distance", peers.options.show_distance)
+        peers.options.show_dps      = imgui.Checkbox("Show DPS", peers.options.show_dps)
+        peers.options.show_target   = imgui.Checkbox("Show Target", peers.options.show_target)
+        peers.options.show_combat   = imgui.Checkbox("Show Combat", peers.options.show_combat)
+        peers.options.show_casting  = imgui.Checkbox("Show Casting", peers.options.show_casting)
+        peers.options.borderless    = imgui.Checkbox("Borderless", peers.options.borderless)
+        peers.options.show_player_stats = imgui.Checkbox("Show Player Stats", peers.options.show_player_stats)
+        peers.options.use_class     = imgui.Checkbox("Use Class Name", peers.options.use_class)
+        imgui.Separator()
+
+        -- Sort submenu
+        if imgui.BeginMenu("Sort By") then
+            if imgui.MenuItem("Alphabetical", nil, peers.options.sort_mode == "Alphabetical") then
+            peers.options.sort_mode = "Alphabetical"
             end
-            imgui.EndMenuBar()
+            if imgui.MenuItem("HP (Asc)",      nil, peers.options.sort_mode == "HP") then
+            peers.options.sort_mode = "HP"
+            end
+            if imgui.MenuItem("Distance (Asc)",nil, peers.options.sort_mode == "Distance") then
+            peers.options.sort_mode = "Distance"
+            end
+            if imgui.MenuItem("DPS (Desc)",    nil, peers.options.sort_mode == "DPS") then
+            peers.options.sort_mode = "DPS"
+            end
+            if imgui.MenuItem("Class", nil, peers.options.sort_mode == "Class") then
+            peers.options.sort_mode = "Class"
+            end
+            imgui.EndMenu()
+        end
+
+        imgui.Separator()
+        if imgui.MenuItem("Show AA Window", nil, showPeerAAWindow.value) then
+            showPeerAAWindow.value = not showPeerAAWindow.value
+        end
+
+        if imgui.MenuItem("Save Config Now") then
+            peers.save_config()
+        end
+
+        imgui.EndPopup()
         end
 
         -- == Player Stats Section ==
-        DrawPlayerStats()
-        ImGui.PushStyleColor(ImGuiCol.ChildBg, ImGui.GetStyleColorVec4(ImGuiCol.Separator))
-        ImGui.BeginChild("ThickSeparator", 0, 6, false, ImGuiWindowFlags.NoScrollbar)
-        ImGui.EndChild()
-        ImGui.PopStyleColor()
-        -- Adds vertical space
-        imgui.Spacing()
+        if peers.options.show_player_stats then
+            DrawPlayerStats()
+            imgui.Separator()
+            imgui.Spacing()
+        end
 
         -- == Switcher Section ==
         local peerData = peers.get_peer_data() -- Get current peer data
@@ -127,7 +155,9 @@ local function CombinedUI()
         imgui.Separator()
 
         -- Child window for peer list with calculated height
-        if imgui.BeginChild("PeerListChild", ImVec2(0, peerData.cached_height), false, ImGuiWindowFlags.None) then
+        local opened = imgui.BeginChild("PeerListChild", ImVec2(0, peerData.cached_height), false, ImGuiWindowFlags.None)
+        if opened then
+            ImGui.SetWindowFontScale(peers.options.font_scale)
             peers.draw_peer_list()
         end
         imgui.EndChild()
