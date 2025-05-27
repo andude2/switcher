@@ -147,7 +147,8 @@ local function CombinedUI()
         local peerData = peers.get_peer_data() -- Get current peer data
         imgui.TextColored(ImVec4(0.7, 0.9, 1, 1), string.format("Peer Switcher (%d)", peerData.count))
         imgui.SameLine(imgui.GetWindowContentRegionWidth() - 100) -- Align AA to the right
-        imgui.TextColored(ImVec4(0.8, 0.8, 1, 1), string.format("My AA: %d", peerData.my_aa))
+        local countNPC = mq.TLO.SpawnCount("NPC")
+        imgui.TextColored(ImVec4(0.8, 0.8, 1, 1), string.format("Zone NPC's: %s", countNPC))
         if imgui.IsItemHovered() then imgui.SetTooltip("Click to toggle Peer AA window") end
         if imgui.IsItemClicked() then
             showPeerAAWindow.value = not showPeerAAWindow.value -- Toggle the flag
@@ -204,8 +205,8 @@ end
 print("[Main] Initializing Modules...")
 local gameState = utils.safeTLO(mq.TLO.MacroQuest.GameState, "UNKNOWN")
 if gameState ~= "INGAME" then
-     print("\ar[Main] Not in game. Please enter the world and restart script.\ax")
-     mq.exit()
+    print("\ar[Main] Not in game. Please enter the world and restart script.\ax")
+    mq.exit()
 end
 
 -- Initialize modules (order might matter if there are dependencies)
