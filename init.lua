@@ -145,10 +145,25 @@ local function CombinedUI()
 
         -- == Switcher Section ==
         local peerData = peers.get_peer_data() -- Get current peer data
-        imgui.TextColored(ImVec4(0.7, 0.9, 1, 1), string.format("Peer Switcher (%d)", peerData.count))
-        imgui.SameLine(imgui.GetWindowContentRegionWidth() - 100) -- Align AA to the right
+        local zonePCCount = mq.TLO.SpawnCount("PC")() -- Get actual PC count in zone
+        local peersInZone = peerData.count -- Assuming this represents peers in zone
+
+        -- Determine color based on whether all peers are in zone
+        local pcCountColor
+        if zonePCCount == peersInZone then
+            pcCountColor = ImVec4(0, 1, 0, 1) -- Green if all peers are in zone
+        else
+            pcCountColor = ImVec4(1, 0, 0, 1) -- Red if counts don't match
+        end
+
+        imgui.TextColored(pcCountColor, string.format("Zone PC's: %d", zonePCCount))
+        imgui.SameLine(imgui.GetWindowContentRegionWidth() - 120)
+        local peerData = peers.get_peer_data()
+        local aaFormatted = string.format("AA Points: %s", peers.formatNumberWithCommas(peerData.my_aa or 0))
+        imgui.TextColored(ImVec4(0.7, 0.9, 1, 1), aaFormatted)
+        --[[imgui.SameLine(imgui.GetWindowContentRegionWidth() - 100) -- Align AA to the right
         local countNPC = mq.TLO.SpawnCount("NPC")
-        imgui.TextColored(ImVec4(0.8, 0.8, 1, 1), string.format("Zone NPC's: %s", countNPC))
+        imgui.TextColored(ImVec4(0.8, 0.8, 1, 1), string.format("Zone NPC's: %s", countNPC))]]
         if imgui.IsItemHovered() then imgui.SetTooltip("Click to toggle Peer AA window") end
         if imgui.IsItemClicked() then
             showPeerAAWindow.value = not showPeerAAWindow.value -- Toggle the flag

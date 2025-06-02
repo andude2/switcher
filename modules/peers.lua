@@ -11,6 +11,7 @@ local config_path = string.format('%s/peer_ui_config.json', mq.configDir)
 local myName = mq.TLO.Me.CleanName() or "Unknown"
 
 local M = {} -- Module table
+local aa_said = false
 
 -- Configuration
 local REFRESH_INTERVAL_MS = 50 -- How often to run the update loop (in ms)
@@ -45,6 +46,9 @@ local lastPublishTime  = 0  -- Timestamp of last published message
 local actor_mailbox    = nil
 local MyName = utils.safeTLO(mq.TLO.Me.CleanName, "Unknown")
 local MyServer = utils.safeTLO(mq.TLO.EverQuest.Server, "Unknown")
+local actualAAPoints = nil -- Stores the actual AA from chat, nil if not captured yet
+local lastAACheckTime = 0  -- Timestamp of last AA check
+local AA_CHECK_INTERVAL = 300 -- Check AA every 5 minutes (300 seconds)
 
 
 -- DPS Tracking Variables
@@ -62,6 +66,59 @@ local leftCombatTime    = 0 -- Timestamp combat ended
 -- local sequenceCounter   = 0 -- Not strictly needed unless debugging sequence
 -- local damTable          = {} -- Damage table for detailed logging (removed for simplicity, re-add if needed)
 -- local tableSize         = 0
+
+-------------------------------------------
+---Capped RoF2 AA Functions
+-------------------------------------------
+
+local function aaGainCallback(line, totalAmount)
+    local cleanTotal = string.gsub(totalAmount, ",", "")  -- Remove commas
+    local total = tonumber(cleanTotal)  -- Convert to number
+
+    if total then
+        actualAAPoints = total
+        --print(string.format("[Peers] AA Update: Gained, now have %d total AA points", total))
+    else
+        print(string.format("[Peers] Warning: Could not parse AA total from: %s", totalAmount or "nil"))
+    end
+end
+
+local function aaDisplayCallback(line, aaAmount)
+    local cleanAmount = string.gsub(aaAmount, ",", "")
+    local points = tonumber(cleanAmount)
+    if points then
+        actualAAPoints = points
+        print(string.format("[Peers] Captured actual AA points: %s", aaAmount))
+    else
+        print(string.format("[Peers] Warning: Could not parse AA amount from: %s", aaAmount or "nil"))
+    end
+end
+
+local function getActualAAPoints()
+    if actualAAPoints then
+        return actualAAPoints
+    end
+    return utils.safeTLO(mq.TLO.Me.AAPoints, 0)
+end
+
+function requestAAUpdate()
+    if M.aa_said then
+        return
+    end
+    mq.cmd('/say AA')
+    M.aa_said = true
+end
+
+local function formatNumberWithCommas(num)
+    if not num or num == 0 then return "0" end
+    local formatted = tostring(num)
+    local k
+    while true do
+        formatted, k = string.gsub(formatted, "^(-?%d+)(%d%d%d)", '%1,%2')
+        if k == 0 then break end
+    end
+    return formatted
+end
 
 -- Helper: Get health bar color
 local function getHealthColor(percent)
@@ -108,6 +165,7 @@ local function publishHealthStatus()
         print('\ar[Peers] Actor mailbox not initialized. Cannot publish status.\ax')
         return
     end
+    requestAAUpdate()
     local status = {
         name = MyName,
         server = MyServer,
@@ -116,10 +174,9 @@ local function publishHealthStatus()
         zone = utils.safeTLO(mq.TLO.Zone.ShortName, "unknown"),
         distance = 0,
         dps = calculateCurrentDPS(),
-        aa = utils.safeTLO(mq.TLO.Me.AAPoints, 0)
+        aa = getActualAAPoints() -- Use our enhanced AA function
     }
     actor_mailbox:send({ mailbox = 'peer_status' }, status)
-    --print(string.format("[Peers] Published status: %s/%s HP: %d%% DPS: %.1f", MyName, MyServer, status.hp, status.dps))
     lastPublishTime = currentTime
 end
 
@@ -188,25 +245,17 @@ end
 
 local function critCallBack(line, dmgStr)
     local dmg = handleDamageEvent(dmgStr)
-    -- Crit damage is often *part* of melee/spell damage already reported.
-    -- Check specific game logs. If it's *extra* damage, add it.
-    -- If it's just a notification of a hit type, don't add it here to avoid double counting.
-    -- Assuming here it's just a notification, so only adding to critTotalBattle for stats if needed.
     critTotalBattle = critTotalBattle + dmg
-    -- We don't add to dmgTotalBattle here assuming the main hit is logged separately.
 end
 
 local function critHealCallBack(line, dmgStr)
-    -- Crit heals don't contribute to dealt DPS.
-    local dmg = handleDamageEvent(dmgStr) -- Still resets combat timer if needed
+    local dmg = handleDamageEvent(dmgStr)
     critHealsTotal = critHealsTotal + dmg
 end
 
 local function nonMeleeCallBack(line, targetOrYou, dmgStr)
     local dmg = handleDamageEvent(dmgStr)
-    local type = "non-melee" -- Default: Spell/proc damage dealt by you
-
-    -- Damage Shield (target hit by non-melee means your DS hit them)
+    local type = "non-melee"
     if string.find(line, "was hit by non-melee for") then
         type = "dShield"
         dmgTotalDS = dmgTotalDS + dmg
@@ -228,35 +277,32 @@ local function checkCombatState()
 
     if currentCombatState ~= 'COMBAT' and enteredCombat then
         if leftCombatTime == 0 then
-             -- First frame out of combat
             leftCombatTime = os.time()
             print("[Peers] Combat ended (timer started).")
         end
-        -- Check if timeout has expired
         if os.difftime(os.time(), leftCombatTime) > BATTLE_DURATION_S then
-             print("[Peers] Combat DPS reset.")
+            print("[Peers] Combat DPS reset.")
             enteredCombat   = false
             battleStartTime = 0
             leftCombatTime  = 0
             -- Reset totals (optional, could keep last fight stats)
-             dmgTotalBattle    = 0
-             dmgBattCounter    = 0
-             critTotalBattle   = 0
-             critHealsTotal    = 0
-             dmgTotalDS        = 0
-             dsCounter         = 0
-             dmgTotalNonMelee  = 0
-             nonMeleeCounter   = 0
+            dmgTotalBattle    = 0
+            dmgBattCounter    = 0
+            critTotalBattle   = 0
+            critHealsTotal    = 0
+            dmgTotalDS        = 0
+            dsCounter         = 0
+            dmgTotalNonMelee  = 0
+            nonMeleeCounter   = 0
         end
     elseif currentCombatState == 'COMBAT' and enteredCombat then
-         -- If we dip out and back in quickly, reset the leftCombatTime
-         if leftCombatTime ~= 0 then
-             print("[Peers] Re-entered combat.")
-             leftCombatTime = 0
-         end
+        -- If we dip out and back in quickly, reset the leftCombatTime
+        if leftCombatTime ~= 0 then
+            print("[Peers] Re-entered combat.")
+            leftCombatTime = 0
+        end
     end
 end
-
 
 -- Peer List Management
 local function cleanupPeers()
@@ -281,23 +327,35 @@ local function refreshPeers()
     local myID = utils.safeTLO(mq.TLO.Me.ID, 0)
     local my_entry_id = MyServer .. "_" .. MyName
 
-    -- Ensure self is in peers table
-    M.peers[my_entry_id] = M.peers[my_entry_id] or {
-        id = my_entry_id,
-        name = MyName,
-        server = MyServer,
-        hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0),
-        mana = utils.safeTLO(mq.TLO.Me.PctMana, 0),
-        zone = myCurrentZone,
-        dps = calculateCurrentDPS(),
-        aa = utils.safeTLO(mq.TLO.Me.AAPoints, 0),
-        last_update = currentTime,
-        distance = 0,
-        inSameZone = true
-    }
+    -- Update self entry in peers table (always refresh the AA value)
+    if M.peers[my_entry_id] then
+        M.peers[my_entry_id].hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0)
+        M.peers[my_entry_id].mana = utils.safeTLO(mq.TLO.Me.PctMana, 0)
+        M.peers[my_entry_id].zone = myCurrentZone
+        M.peers[my_entry_id].dps = calculateCurrentDPS()
+        M.peers[my_entry_id].aa = getActualAAPoints() -- Always update with current AA
+        M.peers[my_entry_id].last_update = currentTime
+        M.peers[my_entry_id].distance = 0
+        M.peers[my_entry_id].inSameZone = true
+    else
+        -- Create new self entry
+        M.peers[my_entry_id] = {
+            id = my_entry_id,
+            name = MyName,
+            server = MyServer,
+            hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0),
+            mana = utils.safeTLO(mq.TLO.Me.PctMana, 0),
+            zone = myCurrentZone,
+            dps = calculateCurrentDPS(),
+            aa = getActualAAPoints(), -- Use our enhanced AA function here too
+            last_update = currentTime,
+            distance = 0,
+            inSameZone = true
+        }
+    end
     table.insert(new_peer_list, M.peers[my_entry_id])
 
-    -- Process other peers
+    -- Process other peers (existing logic, but also update their AA display)
     for id, data in pairs(M.peers) do
         if id == my_entry_id then goto continue end
         if os.difftime(currentTime, data.last_update) <= STALE_DATA_TIMEOUT_S then
@@ -309,25 +367,21 @@ local function refreshPeers()
                     local distance = spawn.Distance3D()
                     if distance ~= nil then
                         data.distance = distance
-                        --print(string.format("[Peers] Distance to %s: %.1f", data.name, data.distance))
                     else
                         data.distance = 9999
-                        --print(string.format("[Peers] Distance3D for %s returned nil", data.name))
                     end
                 else
                     data.distance = 9999
-                    --print(string.format("[Peers] Spawn not found for %s (ID=%s)", data.name, spawn.ID() or "nil"))
                 end
             else
                 data.distance = 9999
-                --print(string.format("[Peers] %s is in different zone: %s", data.name, data.zone))
             end
             table.insert(new_peer_list, data)
         end
         ::continue::
     end
 
-    -- Apply Sorting
+    -- Apply Sorting (existing logic)
     if M.options.sort_mode == "Alphabetical" then
         table.sort(new_peer_list, function(a, b) return a.name:lower() < b.name:lower() end)
     elseif M.options.sort_mode == "HP" then
@@ -351,7 +405,6 @@ local function refreshPeers()
 
     cleanupPeers()
 end
-
 
 -- Switcher Actions
 local function switchTo(name)
@@ -572,41 +625,80 @@ function M.draw_peer_list()
 end
 
 function M.draw_aa_window()
-    if not M.show_aa_window.value then return end -- Check the flag passed from main
-
-    -- Use a boolean directly for Begin, passing the reference table value
+    if not M.show_aa_window.value then return end
     local window_open = M.show_aa_window.value
-    imgui.SetNextWindowSize(ImVec2(250, 300), ImGuiCond.FirstUseEver) -- Initial size
-
-    if imgui.Begin("Peer AA Counts", window_open, ImGuiWindowFlags.NoCollapse) then
+    imgui.SetNextWindowSize(ImVec2(400, 500), ImGuiCond.FirstUseEver)
+    if imgui.Begin("Peer AA Totals", window_open, bit32.bor(ImGuiWindowFlags.NoCollapse)) then
+        -- Header with close button and peer count
         if imgui.Button("Close") then
-            M.show_aa_window.value = false -- Modify the reference table value
+            M.show_aa_window.value = false
         end
+        imgui.SameLine()
+        imgui.TextDisabled("(" .. #M.peer_list .. " peers)")
         imgui.Separator()
-
-        -- Create a temporary sorted list for AA display if needed (peer_list might be sorted differently)
+        -- Sort peers alphabetically by name
         local aa_list = {}
         for _, p in ipairs(M.peer_list) do table.insert(aa_list, p) end
-        table.sort(aa_list, function(a, b) return a.name:lower() < b.name:lower() end)
-
-        if imgui.BeginTable("PeerAATable", 2, bit32.bor(ImGuiTableFlags.Borders, ImGuiTableFlags.RowBg, ImGuiTableFlags.ScrollY)) then
+        table.sort(aa_list, function(a, b)
+            local name_a = (a.name or "Unknown"):lower()
+            local name_b = (b.name or "Unknown"):lower()
+            return name_a < name_b
+        end)
+        local total_aa = 0
+        for _, peer in ipairs(aa_list) do
+            total_aa = total_aa + (peer.aa or 0)
+        end
+        local avg_aa = math.floor(total_aa / math.max(1, #aa_list))
+        -- Stats header
+        imgui.Text("Total AA: " .. formatNumberWithCommas(total_aa))
+        local row_height = imgui.GetTextLineHeightWithSpacing()
+        local max_rows = #aa_list
+        local table_height = math.min(max_rows * row_height + 20, 500)
+        -- Begin clean table with 3 columns
+        local tableFlags = bit32.bor(
+            ImGuiTableFlags.Borders,
+            ImGuiTableFlags.RowBg,
+            ImGuiTableFlags.ScrollY,
+            ImGuiTableFlags.SizingFixedFit
+        )
+        if imgui.BeginTable("PeerAATable", 3, tableFlags, ImVec2(0, table_height)) then
             imgui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch)
-            imgui.TableSetupColumn("AA Points", ImGuiTableColumnFlags.WidthFixed, 80)
+            imgui.TableSetupColumn("AA Points", ImGuiTableColumnFlags.WidthFixed, 90) -- Increased width
+            imgui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 60) -- Empty header for suffix
             imgui.TableHeadersRow()
-
             for _, peer in ipairs(aa_list) do
                 imgui.TableNextRow()
+                local aa_val = peer.aa or 0
+                local isSelf = (peer.name == MyName and peer.server == MyServer)
+                -- Name Column
                 imgui.TableNextColumn()
                 imgui.Text(peer.name or "Unknown")
                 imgui.TableNextColumn()
-                imgui.Text(tostring(peer.aa or 0))
+                local aa_text = formatNumberWithCommas(aa_val)
+                local text_width = imgui.CalcTextSize(aa_text)
+                local cell_width = imgui.GetColumnWidth()
+                imgui.SetCursorPosX(imgui.GetCursorPosX() + (cell_width - text_width - imgui.GetStyle().ItemSpacing.x) / 2)
+                imgui.PushStyleColor(ImGuiCol.Text, ImVec4(0.7, 0.9, 1.0, 1.0)) -- Light blue
+                imgui.Text(aa_text)
+                imgui.PopStyleColor()
+                -- Suffix Column
+                imgui.TableNextColumn()
+                local suffix = ""
+                if aa_val >= 1000000 then
+                    suffix = string.format("(%.1fM)", aa_val / 1000000)
+                elseif aa_val >= 1000 then
+                    suffix = string.format("(%.1fK)", aa_val / 1000)
+                end
+                if suffix ~= "" then
+                    imgui.PushStyleColor(ImGuiCol.Text, ImVec4(0.3, 1.0, 0.3, 1.0)) -- Green
+                    imgui.Text(suffix)
+                    imgui.PopStyleColor()
+                end
             end
             imgui.EndTable()
         end
     end
     imgui.End()
-
-    -- Important: Update the external flag if the window was closed via 'X'
     if not window_open then
         M.show_aa_window.value = false
     end
@@ -672,7 +764,6 @@ function M.init()
         return
     end
     print("[Peers] Actor mailbox registered successfully.")
-    -- Register DPS events
     mq.event("melee_crit", "#*#You score a critical hit!#*#(#1#)#*#", critCallBack)
     mq.event("melee_crit2", "#*#You deliver a critical blast!#*#(#1#)#*#", critCallBack)
     mq.event("melee_crit3", string.format("#*#%s scores a critical hit!#*#(#1#)#*#", MyName), critCallBack)
@@ -683,7 +774,15 @@ function M.init()
     mq.event("melee_damage_shield", "#*#was hit by non-melee for #2# points of damage#*#", nonMeleeCallBack)
     mq.event("melee_you_hit_non-melee", "#*#You were hit by non-melee for #2# damage#*#", nonMeleeCallBack)
     mq.event("melee_crit_heal", "#*#You perform an exceptional heal!#*#(#1#)#*#", critHealCallBack)
-    print("[Peers] DPS events registered.")
+    mq.event("aa_display_capture", "Unspent AA: #1#", aaDisplayCallback)
+    mq.event("aa_gain_capture", "#*#You now have #1# ability point(s)#*#", aaGainCallback)
+    print("[Peers] DPS and AA events registered.")
+        if not M.aa_said then
+        mq.cmd('/say AA')
+        M.aa_said = true
+    end
+    lastAACheckTime = os.time()
+    
     refreshPeers()
     print("[Peers] Initialization complete.")
 end
@@ -693,7 +792,7 @@ function M.get_peer_data()
     return {
         list = M.peer_list,
         count = #M.peer_list,
-        my_aa = utils.safeTLO(mq.TLO.Me.AAPoints, 0),
+        my_aa = getActualAAPoints(),
         cached_height = cachedPeerHeight
     }
 end
@@ -701,5 +800,7 @@ end
 function M.get_refresh_interval()
     return REFRESH_INTERVAL_MS
 end
+
+M.formatNumberWithCommas = formatNumberWithCommas
 
 return M
