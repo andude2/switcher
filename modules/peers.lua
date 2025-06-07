@@ -278,10 +278,10 @@ local function checkCombatState()
     if currentCombatState ~= 'COMBAT' and enteredCombat then
         if leftCombatTime == 0 then
             leftCombatTime = os.time()
-            print("[Peers] Combat ended (timer started).")
+            --print("[Peers] Combat ended (timer started).")
         end
         if os.difftime(os.time(), leftCombatTime) > BATTLE_DURATION_S then
-            print("[Peers] Combat DPS reset.")
+            --print("[Peers] Combat DPS reset.")
             enteredCombat   = false
             battleStartTime = 0
             leftCombatTime  = 0
@@ -298,7 +298,7 @@ local function checkCombatState()
     elseif currentCombatState == 'COMBAT' and enteredCombat then
         -- If we dip out and back in quickly, reset the leftCombatTime
         if leftCombatTime ~= 0 then
-            print("[Peers] Re-entered combat.")
+            --print("[Peers] Re-entered combat.")
             leftCombatTime = 0
         end
     end
