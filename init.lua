@@ -1,5 +1,6 @@
 -- main.lua
 -- Main script orchestrating the Peer Switcher and Buff Display modules
+-- Enhanced with group window display options
 
 local mq = require 'mq'
 local imgui = require 'ImGui'
@@ -91,6 +92,55 @@ local function CombinedUI()
         imgui.Text("Switcher Options")
         imgui.Separator()
 
+        -- Display Style Options
+        imgui.Text("Display Style:")
+        local current_style = peers.options.display_style
+        local style_changed = false
+        if imgui.RadioButton("Auto", current_style == "auto") then
+            peers.options.display_style = "auto"
+            style_changed = true
+        end
+        imgui.SameLine()
+        if imgui.RadioButton("Table", current_style == "table") then
+            peers.options.display_style = "table"
+            style_changed = true
+        end
+        imgui.SameLine()
+        if imgui.RadioButton("Group", current_style == "group") then
+            peers.options.display_style = "group"
+            style_changed = true
+        end
+        
+        -- Group Window Threshold
+        imgui.PushItemWidth(80)
+        local threshold_changed = false
+        peers.options.group_window_threshold, threshold_changed = imgui.SliderInt("Auto Switch Threshold", peers.options.group_window_threshold, 1, 20)
+        imgui.PopItemWidth()
+        
+        if style_changed or threshold_changed then
+            peers.recalculate_height()
+            peers.save_config()
+        end
+        
+        imgui.Separator()
+
+        -- Group Window Specific Options
+        if peers.options.display_style == "group" or (#peers.get_peer_data().list <= peers.options.group_window_threshold and peers.options.display_style ~= "table") then
+            imgui.Text("Group Window Options:")
+            local endurance_changed = false
+            local compact_changed = false
+            peers.options.show_endurance, endurance_changed = imgui.Checkbox("Show Endurance Bars", peers.options.show_endurance)
+            peers.options.compact_mode, compact_changed = imgui.Checkbox("Compact Mode", peers.options.compact_mode)
+            peers.options.show_pet_bars = imgui.Checkbox("Show Pet Bars", peers.options.show_pet_bars)
+            
+            if endurance_changed or compact_changed then
+                peers.recalculate_height()
+                peers.save_config()
+            end
+            imgui.Separator()
+        end
+
+        -- Standard Options
         peers.options.show_name     = imgui.Checkbox("Show Name", peers.options.show_name)
         peers.options.show_hp       = imgui.Checkbox("Show HP (%)", peers.options.show_hp)
         peers.options.show_mana     = imgui.Checkbox("Show Mana (%)", peers.options.show_mana)
@@ -108,18 +158,23 @@ local function CombinedUI()
         if imgui.BeginMenu("Sort By") then
             if imgui.MenuItem("Alphabetical", nil, peers.options.sort_mode == "Alphabetical") then
             peers.options.sort_mode = "Alphabetical"
+            peers.save_config()
             end
             if imgui.MenuItem("HP (Asc)",      nil, peers.options.sort_mode == "HP") then
             peers.options.sort_mode = "HP"
+            peers.save_config()
             end
             if imgui.MenuItem("Distance (Asc)",nil, peers.options.sort_mode == "Distance") then
             peers.options.sort_mode = "Distance"
+            peers.save_config()
             end
             if imgui.MenuItem("DPS (Desc)",    nil, peers.options.sort_mode == "DPS") then
             peers.options.sort_mode = "DPS"
+            peers.save_config()
             end
             if imgui.MenuItem("Class", nil, peers.options.sort_mode == "Class") then
             peers.options.sort_mode = "Class"
+            peers.save_config()
             end
             imgui.EndMenu()
         end
@@ -169,6 +224,15 @@ local function CombinedUI()
             showPeerAAWindow.value = not showPeerAAWindow.value -- Toggle the flag
         end
         imgui.Separator()
+
+        -- Display style indicator
+        local shouldUseGroupStyle = peers.options.display_style == "group" or 
+                                   (peerData.count <= peers.options.group_window_threshold and peers.options.display_style ~= "table")
+        local styleText = shouldUseGroupStyle and "Group Style" or "Table Style"
+        local styleColor = shouldUseGroupStyle and ImVec4(0.7, 1, 0.7, 1) or ImVec4(0.7, 0.7, 1, 1)
+        imgui.TextColored(styleColor, styleText)
+        imgui.SameLine()
+        imgui.TextDisabled(string.format("(%d peers)", peerData.count))
 
         -- Child window for peer list with calculated height
         local opened = imgui.BeginChild("PeerListChild", ImVec2(0, peerData.cached_height), false, ImGuiWindowFlags.None)

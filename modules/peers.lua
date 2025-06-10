@@ -1,5 +1,6 @@
 -- peers.lua
 -- Handles peer status, DPS tracking, and switching logic
+-- Enhanced with traditional group window display option
 
 local mq = require('mq')
 local imgui = require('ImGui')
@@ -36,11 +37,18 @@ M.options = {           -- Options controlled by the main UI menu
     show_player_stats = true,
     use_class     = false,
     font_scale = 1.0,
+    -- New options for group window
+    display_style = "auto", -- "auto", "table" or "group" - changed default to auto
+    group_window_threshold = 8, -- Switch to group style when <= this many peers
+    show_endurance = true,
+    show_pet_bars = false,
+    compact_mode = false,
 }
 M.show_aa_window = { value = false } -- Control the visibility of the AA window
 
 local lastPeerCount    = 0
-local cachedPeerHeight = 300 -- Default height
+local lastDisplayStyle = "" -- Track display style changes
+local cachedPeerHeight = 150 -- Default height - reduced from 300
 local lastUpdateTime   = {} -- [id] = timestamp of last message received
 local lastPublishTime  = 0  -- Timestamp of last published message
 local actor_mailbox    = nil
@@ -49,7 +57,6 @@ local MyServer = utils.safeTLO(mq.TLO.EverQuest.Server, "Unknown")
 local actualAAPoints = nil -- Stores the actual AA from chat, nil if not captured yet
 local lastAACheckTime = 0  -- Timestamp of last AA check
 local AA_CHECK_INTERVAL = 300 -- Check AA every 5 minutes (300 seconds)
-
 
 -- DPS Tracking Variables
 local dmgTotalBattle    = 0
@@ -63,13 +70,15 @@ local nonMeleeCounter   = 0
 local battleStartTime   = 0 -- Timestamp combat started
 local enteredCombat     = false
 local leftCombatTime    = 0 -- Timestamp combat ended
--- local sequenceCounter   = 0 -- Not strictly needed unless debugging sequence
--- local damTable          = {} -- Damage table for detailed logging (removed for simplicity, re-add if needed)
--- local tableSize         = 0
 
 -------------------------------------------
----Capped RoF2 AA Functions
+---AA Functions with Server-Specific Logic
 -------------------------------------------
+
+local function isEZLinuxServer()
+    local serverName = utils.safeTLO(mq.TLO.EverQuest.Server, "")
+    return serverName == "EZ (Linux) x4 Exp"
+end
 
 local function aaGainCallback(line, totalAmount)
     local cleanTotal = string.gsub(totalAmount, ",", "")  -- Remove commas
@@ -95,13 +104,23 @@ local function aaDisplayCallback(line, aaAmount)
 end
 
 local function getActualAAPoints()
-    if actualAAPoints then
-        return actualAAPoints
+    if isEZLinuxServer() then
+        -- Use captured AA from chat for EZ Linux server
+        if actualAAPoints then
+            return actualAAPoints
+        end
+        return utils.safeTLO(mq.TLO.Me.AAPoints, 0) -- Fallback to TLO if no chat capture yet
+    else
+        -- Use TLO directly for all other servers
+        return utils.safeTLO(mq.TLO.Me.AAPoints, 0)
     end
-    return utils.safeTLO(mq.TLO.Me.AAPoints, 0)
 end
 
 function requestAAUpdate()
+    if not isEZLinuxServer() then
+        return -- Don't request AA updates on non-EZ servers
+    end
+    
     if M.aa_said then
         return
     end
@@ -120,28 +139,45 @@ local function formatNumberWithCommas(num)
     return formatted
 end
 
--- Helper: Get health bar color
+-- Helper: Check if class uses mana
+local function classUsesMana(class)
+    if not class then return true end -- Default to showing mana if unknown
+    local noManaClasses = {
+        "WAR", "ROG", "MNK", "BER" -- Warrior, Rogue, Monk, Berserker
+    }
+    for _, noManaClass in ipairs(noManaClasses) do
+        if class == noManaClass then
+            return false
+        end
+    end
+    return true
+end
+
+-- Helper: Get health bar color - simple red for group view
 local function getHealthColor(percent)
+    return ImVec4(0.8, 0.2, 0.2, 1) -- Consistent red for group view bars
+end
+
+-- Helper: Get health text color - dynamic for table view
+local function getHealthTextColor(percent)
     percent = percent or 0
-    if percent < 35 then
-        return ImVec4(1, 0, 0, 1) -- Red
-    elseif percent < 75 then
-        return ImVec4(1, 1, 0, 1) -- Yellow
+    if percent < 30 then
+        return ImVec4(1, 0.2, 0.2, 1) -- Red for low HP
+    elseif percent <= 80 then
+        return ImVec4(1, 1, 0.2, 1) -- Yellow for medium HP
     else
-        return ImVec4(0, 1, 0, 1) -- Green
+        return ImVec4(0.2, 1, 0.2, 1) -- Green for high HP
     end
 end
 
--- Helper: Get mana bar color (unchanged)
+-- Helper: Get mana bar color - simple blue for all mana
 local function getManaColor(percent)
-    percent = percent or 0
-    if percent < 35 then
-        return ImVec4(0.5, 0.5, 0, 1) -- Dark Yellow/Reddish for low mana
-    elseif percent < 75 then
-        return ImVec4(1, 1, 0, 1) -- Yellow
-    else
-        return ImVec4(0.678, 0.847, 0.902, 1) -- Light Blue
-    end
+    return ImVec4(0.2, 0.4, 0.8, 1) -- Consistent blue for all mana levels
+end
+
+-- Helper: Get endurance bar color - simple yellow for all endurance
+local function getEnduranceColor(percent)
+    return ImVec4(0.8, 0.8, 0.2, 1) -- Consistent yellow for all endurance levels
 end
 
 -- Helper: Calculate current DPS
@@ -171,10 +207,16 @@ local function publishHealthStatus()
         server = MyServer,
         hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0),
         mana = utils.safeTLO(mq.TLO.Me.PctMana, 0),
+        endurance = utils.safeTLO(mq.TLO.Me.PctEndurance, 0),
         zone = utils.safeTLO(mq.TLO.Zone.ShortName, "unknown"),
         distance = 0,
         dps = calculateCurrentDPS(),
-        aa = getActualAAPoints() -- Use our enhanced AA function
+        aa = getActualAAPoints(),
+        class = utils.safeTLO(mq.TLO.Me.Class.ShortName, "UNK"),
+        level = utils.safeTLO(mq.TLO.Me.Level, 1),
+        target = utils.safeTLO(mq.TLO.Target.CleanName, "None"),
+        combat_state = utils.safeTLO(mq.TLO.Me.CombatState, "UNKNOWN") == "COMBAT",
+        casting = utils.safeTLO(mq.TLO.Me.Casting.Name, "None")
     }
     actor_mailbox:send({ mailbox = 'peer_status' }, status)
     lastPublishTime = currentTime
@@ -200,9 +242,15 @@ local function peer_message_handler(message)
         server = content.server,
         hp = content.hp or 0,
         mana = content.mana or 0,
+        endurance = content.endurance or 0,
         zone = content.zone or "unknown",
         dps = content.dps or 0,
         aa = content.aa or 0,
+        class = content.class or "UNK",
+        level = content.level or 1,
+        target = content.target or "None",
+        combat_state = content.combat_state or false,
+        casting = content.casting or "None",
         last_update = currentTime,
         distance = 0,
         inSameZone = false
@@ -331,9 +379,15 @@ local function refreshPeers()
     if M.peers[my_entry_id] then
         M.peers[my_entry_id].hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0)
         M.peers[my_entry_id].mana = utils.safeTLO(mq.TLO.Me.PctMana, 0)
+        M.peers[my_entry_id].endurance = utils.safeTLO(mq.TLO.Me.PctEndurance, 0)
         M.peers[my_entry_id].zone = myCurrentZone
         M.peers[my_entry_id].dps = calculateCurrentDPS()
-        M.peers[my_entry_id].aa = getActualAAPoints() -- Always update with current AA
+        M.peers[my_entry_id].aa = getActualAAPoints()
+        M.peers[my_entry_id].class = utils.safeTLO(mq.TLO.Me.Class.ShortName, "UNK")
+        M.peers[my_entry_id].level = utils.safeTLO(mq.TLO.Me.Level, 1)
+        M.peers[my_entry_id].target = utils.safeTLO(mq.TLO.Target.CleanName, "None")
+        M.peers[my_entry_id].combat_state = utils.safeTLO(mq.TLO.Me.CombatState, "UNKNOWN") == "COMBAT"
+        M.peers[my_entry_id].casting = utils.safeTLO(mq.TLO.Me.Casting.Name, "None")
         M.peers[my_entry_id].last_update = currentTime
         M.peers[my_entry_id].distance = 0
         M.peers[my_entry_id].inSameZone = true
@@ -345,9 +399,15 @@ local function refreshPeers()
             server = MyServer,
             hp = utils.safeTLO(mq.TLO.Me.PctHPs, 0),
             mana = utils.safeTLO(mq.TLO.Me.PctMana, 0),
+            endurance = utils.safeTLO(mq.TLO.Me.PctEndurance, 0),
             zone = myCurrentZone,
             dps = calculateCurrentDPS(),
-            aa = getActualAAPoints(), -- Use our enhanced AA function here too
+            aa = getActualAAPoints(),
+            class = utils.safeTLO(mq.TLO.Me.Class.ShortName, "UNK"),
+            level = utils.safeTLO(mq.TLO.Me.Level, 1),
+            target = utils.safeTLO(mq.TLO.Target.CleanName, "None"),
+            combat_state = utils.safeTLO(mq.TLO.Me.CombatState, "UNKNOWN") == "COMBAT",
+            casting = utils.safeTLO(mq.TLO.Me.Casting.Name, "None"),
             last_update = currentTime,
             distance = 0,
             inSameZone = true
@@ -390,17 +450,72 @@ local function refreshPeers()
         table.sort(new_peer_list, function(a, b) return (a.distance or 9999) < (b.distance or 9999) end)
     elseif M.options.sort_mode == "DPS" then
         table.sort(new_peer_list, function(a, b) return (a.dps or 0) > (b.dps or 0) end)
+    elseif M.options.sort_mode == "Class" then
+        table.sort(new_peer_list, function(a, b) 
+            if (a.class or "UNK") == (b.class or "UNK") then
+                return a.name:lower() < b.name:lower()
+            end
+            return (a.class or "UNK") < (b.class or "UNK")
+        end)
     end
 
     M.peer_list = new_peer_list
 
-    -- Update cached height
+    -- Update cached height - dynamic calculation based on display style
     local peerCount = #M.peer_list
-    if peerCount ~= lastPeerCount then
+    local shouldUseGroupStyle = M.options.display_style == "group" or 
+                               (peerCount <= M.options.group_window_threshold and M.options.display_style == "auto")
+    local currentDisplayStyle = shouldUseGroupStyle and "group" or "table"
+    
+    -- Recalculate if peer count changed OR display style changed OR options that affect height changed
+    if peerCount ~= lastPeerCount or currentDisplayStyle ~= lastDisplayStyle then
         lastPeerCount = peerCount
-        local peerRowHeight = 20
-        local headerHeight = 38
-        cachedPeerHeight = math.min((peerCount * peerRowHeight) + headerHeight)
+        lastDisplayStyle = currentDisplayStyle
+        
+        if shouldUseGroupStyle then
+            -- Group window style - calculate based on bars per peer
+            local baseRowHeight = 24 -- Name/level line (increased)
+            local barHeight = 20 -- Each progress bar (increased from 14 to 20)
+            local barSpacing = 3 -- Spacing between bars (increased)
+            local peerSpacing = M.options.compact_mode and 6 or 10 -- Spacing between peers (increased)
+            
+            -- Calculate bars per peer dynamically
+            local totalBarsForAllPeers = 0
+            for _, peer in ipairs(M.peer_list) do
+                local barsForThisPeer = 1 -- HP always present
+                if classUsesMana(peer.class) then
+                    barsForThisPeer = barsForThisPeer + 1 -- Mana
+                end
+                if M.options.show_endurance then
+                    barsForThisPeer = barsForThisPeer + 1 -- Endurance
+                end
+                totalBarsForAllPeers = totalBarsForAllPeers + barsForThisPeer
+            end
+            
+            local statusLineHeight = M.options.compact_mode and 0 or 20 -- Target/combat/casting info (increased)
+            local totalStatusLines = M.options.compact_mode and 0 or peerCount
+            
+            local headerHeight = 25 -- Style indicator
+            local totalBarHeight = totalBarsForAllPeers * (barHeight + barSpacing)
+            local totalBaseHeight = peerCount * baseRowHeight
+            local totalPeerSpacing = math.max(0, peerCount - 1) * peerSpacing
+            local totalStatusHeight = totalStatusLines * statusLineHeight
+            
+            cachedPeerHeight = math.max(100, math.min(
+                headerHeight + totalBaseHeight + totalBarHeight + totalPeerSpacing + totalStatusHeight, 
+                700 -- Increased max height
+            ))
+        else
+            -- Table style - original calculation  
+            local peerRowHeight = 22
+            local headerHeight = 45 -- Table headers + some padding
+            cachedPeerHeight = math.max(80, math.min((peerCount * peerRowHeight) + headerHeight, 500))
+        end
+        
+        -- Extra small adjustment for empty lists
+        if peerCount == 0 then
+            cachedPeerHeight = 80
+        end
     end
 
     cleanupPeers()
@@ -421,9 +536,114 @@ local function targetCharacter(name)
     end
 end
 
+-- NEW: Group Window Style Drawing Function
+function M.draw_group_window()
+    for i, peer in ipairs(M.peer_list) do
+        local isSelf = (peer.name == MyName and peer.server == MyServer)
+        
+        -- Character header with level and class
+        imgui.PushID(peer.id)
+        
+        -- Name/Level line - increased height
+        local nameColor = isSelf and ImVec4(1, 1, 0.7, 1) or ImVec4(0.9, 0.9, 0.9, 1)
+        if not peer.inSameZone then
+            nameColor = ImVec4(0.6, 0.6, 0.6, 1) -- Grayed out if not in zone
+        end
+        
+        imgui.PushStyleColor(ImGuiCol.Text, nameColor)
+        -- Just show name without distance (distance will be shown in level/class line)
+        local displayText = peer.name
+        
+        -- Make the name clickable
+        if imgui.Selectable(displayText .. "##name", false, ImGuiSelectableFlags.None) then
+            if not isSelf then switchTo(peer.name) end
+        end
+        imgui.PopStyleColor()
+        
+        -- Right click to target
+        if not isSelf and imgui.IsItemClicked(ImGuiMouseButton.Right) then
+            targetCharacter(peer.name)
+        end
+        
+        -- Show distance, level and class on same line
+        imgui.SameLine()
+        local distanceText = ""
+        if M.options.show_distance and peer.distance and peer.distance < 9999 and peer.inSameZone then
+            distanceText = string.format("(%d) ", math.floor(peer.distance))
+        end
+        imgui.TextColored(ImVec4(0.7, 0.9, 1, 1), string.format("%sLevel %d %s", distanceText, peer.level or 1, peer.class or "UNK"))
+        
+        -- Health Bar - increased height
+        local hp_percent = (peer.hp or 0) / 100.0
+        local hp_color = getHealthColor(peer.hp or 0)
+        imgui.PushStyleColor(ImGuiCol.PlotHistogram, hp_color)
+        imgui.ProgressBar(hp_percent, ImVec2(-1, 18), string.format("HP: %d%%", peer.hp or 0))
+        imgui.PopStyleColor()
+        
+        -- Mana Bar (only if character class uses mana) - increased height
+        if classUsesMana(peer.class) then
+            local mana_percent = (peer.mana or 0) / 100.0
+            local mana_color = getManaColor(peer.mana or 0)
+            imgui.PushStyleColor(ImGuiCol.PlotHistogram, mana_color)
+            imgui.ProgressBar(mana_percent, ImVec2(-1, 18), string.format("Mana: %d%%", peer.mana or 0))
+            imgui.PopStyleColor()
+        end
+        
+        -- Endurance Bar (if enabled) - increased height
+        if M.options.show_endurance then
+            local end_percent = (peer.endurance or 0) / 100.0
+            local end_color = getEnduranceColor(peer.endurance or 0)
+            imgui.PushStyleColor(ImGuiCol.PlotHistogram, end_color)
+            imgui.ProgressBar(end_percent, ImVec2(-1, 18), string.format("End: %d%%", peer.endurance or 0))
+            imgui.PopStyleColor()
+        end
+        
+        -- Optional: Show additional info in compact form
+        if not M.options.compact_mode then
+            -- Target and status line
+            local statusText = ""
+            if M.options.show_target and peer.target and peer.target ~= "None" then
+                statusText = "Target: " .. peer.target
+            end
+            if M.options.show_combat and peer.combat_state then
+                if statusText ~= "" then statusText = statusText .. " | " end
+                statusText = statusText .. "Fighting"
+            end
+            if M.options.show_casting and peer.casting and peer.casting ~= "None" then
+                if statusText ~= "" then statusText = statusText .. " | " end
+                statusText = statusText .. "Casting: " .. peer.casting
+            end
+            if M.options.show_dps and peer.dps and peer.dps > 0 then
+                if statusText ~= "" then statusText = statusText .. " | " end
+                statusText = statusText .. "DPS: " .. utils.cleanNumber(peer.dps, 1, true)
+            end
+            
+            if statusText ~= "" then
+                imgui.TextColored(ImVec4(0.8, 0.8, 0.8, 1), statusText)
+            end
+        end
+        
+        imgui.PopID()
+        
+        -- Add some spacing between group members
+        if i < #M.peer_list then
+            imgui.Spacing()
+        end
+    end
+end
 
 -- Drawing Functions
 function M.draw_peer_list()
+    -- Auto-switch display style based on peer count
+    local shouldUseGroupStyle = M.options.display_style == "group" or 
+                               (#M.peer_list <= M.options.group_window_threshold and M.options.display_style ~= "table")
+    
+    if shouldUseGroupStyle then
+        M.draw_group_window()
+        return
+    end
+    
+    -- Original table style code...
     -- Determine column count (this part remains the same)
     local column_count = 0
     local first_column_is_name_or_class = false
@@ -535,7 +755,7 @@ function M.draw_peer_list()
         -- HP Column
         if M.options.show_hp then
             imgui.TableNextColumn()
-            local hpColor = getHealthColor(peer.hp)
+            local hpColor = getHealthTextColor(peer.hp) -- Use dynamic color for table text
             imgui.PushStyleColor(ImGuiCol.Text, hpColor)
             imgui.Text("%.0f%%", peer.hp or 0)
             imgui.PopStyleColor()
@@ -741,7 +961,6 @@ end
 
 -- Main update function for the peer module
 function M.update()
-
     checkCombatState()
     publishHealthStatus() -- Publish own status periodically
     refreshPeers()        -- Refresh peer list, distances, and sorting
@@ -774,12 +993,20 @@ function M.init()
     mq.event("melee_damage_shield", "#*#was hit by non-melee for #2# points of damage#*#", nonMeleeCallBack)
     mq.event("melee_you_hit_non-melee", "#*#You were hit by non-melee for #2# damage#*#", nonMeleeCallBack)
     mq.event("melee_crit_heal", "#*#You perform an exceptional heal!#*#(#1#)#*#", critHealCallBack)
-    mq.event("aa_display_capture", "Unspent AA: #1#", aaDisplayCallback)
-    mq.event("aa_gain_capture", "#*#You now have #1# ability point(s)#*#", aaGainCallback)
-    print("[Peers] DPS and AA events registered.")
+    
+    -- Only register AA events for EZ Linux server
+    if isEZLinuxServer() then
+        mq.event("aa_display_capture", "Unspent AA: #1#", aaDisplayCallback)
+        mq.event("aa_gain_capture", "#*#You now have #1# ability point(s)#*#", aaGainCallback)
+        print("[Peers] DPS and AA events registered for EZ Linux server.")
+        
+        -- Request initial AA update
         if not M.aa_said then
-        mq.cmd('/say AA')
-        M.aa_said = true
+            mq.cmd('/say AA')
+            M.aa_said = true
+        end
+    else
+        print("[Peers] DPS events registered. Using TLO for AA points on this server.")
     end
     lastAACheckTime = os.time()
     
@@ -799,6 +1026,12 @@ end
 
 function M.get_refresh_interval()
     return REFRESH_INTERVAL_MS
+end
+
+-- Force height recalculation (call when display options change)
+function M.recalculate_height()
+    lastPeerCount = -1 -- Force recalculation
+    lastDisplayStyle = "" -- Force recalculation
 end
 
 M.formatNumberWithCommas = formatNumberWithCommas
